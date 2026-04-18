@@ -2,3 +2,7 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# 로컬 자동 실행 로그
+auto_gen_history.log
+auto_gen_last.log

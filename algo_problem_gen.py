@@ -77,6 +77,8 @@ JSON 앞뒤에 설명 문장, 마크다운 코드펜스, 주석을 넣지 마세
 - 예제는 최소 2개.
 - solution_explanation은 초보자도 따라갈 수 있게 단계적으로.
 - reference_solution은 컴파일·실행 가능한 형태로.
+- JSON 문자열 값 안에 **실제 줄바꿈(엔터)을 넣지 말 것**. 줄바꿈은 반드시 이스케이프 `\\n`으로만 표현 (파싱 오류 방지).
+- samples[].explanation 은 한 줄~두 줄로 짧게. 말줄임 `…` 뒤에 따옴표를 닫지 않는 실수 금지.
 """
 
 
@@ -281,6 +283,8 @@ def generate_problem(
     extra: str | None,
     language: str,
     problem_type: str | None,
+    *,
+    max_json_retries: int = 3,
 ) -> dict[str, Any]:
     lang = normalize_language(language)
     user_parts = [
@@ -294,30 +298,41 @@ def generate_problem(
     if extra:
         user_parts.append(f"추가 요청: {extra}.")
     user_parts.append("위 조건에 맞는 새 문제 하나를 JSON으로만 출력하세요.")
+    user_content = " ".join(user_parts)
 
-    response = client.chat(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": " ".join(user_parts)},
-        ],
-        format="json",
-        options={"temperature": 0.72},
-    )
-    content = response.get("message", {}).get("content", "")
-    if not content:
-        raise RuntimeError("모델이 빈 응답을 반환했습니다.")
+    last_err: BaseException | None = None
+    for attempt in range(max_json_retries):
+        temp = max(0.35, 0.72 - attempt * 0.12)
+        try:
+            response = client.chat(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                format="json",
+                options={"temperature": temp},
+            )
+            content = response.get("message", {}).get("content", "")
+            if not content:
+                raise RuntimeError("모델이 빈 응답을 반환했습니다.")
 
-    data = _extract_json_object(content)
-    data["language"] = lang
-    if problem_type:
-        data["type"] = problem_type
-    _validate_problem(data)
+            data = _extract_json_object(content)
+            data["language"] = lang
+            if problem_type:
+                data["type"] = problem_type
+            _validate_problem(data)
 
-    out_lang = normalize_language(str(data.get("language", lang)))
-    if out_lang != lang:
-        data["language"] = lang
-    return data
+            out_lang = normalize_language(str(data.get("language", lang)))
+            if out_lang != lang:
+                data["language"] = lang
+            return data
+        except (ValueError, json.JSONDecodeError, RuntimeError) as e:
+            last_err = e
+            if attempt + 1 >= max_json_retries:
+                raise
+    assert last_err is not None
+    raise last_err
 
 
 def unique_md_path(directory: Path, base_slug: str) -> Path:
@@ -505,6 +520,13 @@ def main() -> int:
     host = args.host.strip()
     client = ollama.Client(host=host) if host else ollama.Client()
 
+    repo: Path | None = None
+    if args.git_push:
+        repo = _get_git_root(_SCRIPT_DIR)
+        if not repo:
+            print("\n[git] 스크립트 위치가 git 저장소 안이 아니어서 --git-push 를 쓸 수 없습니다.", file=sys.stderr)
+            return 4
+
     per = max(1, args.per)
     jobs: list[tuple[str, str]] = []
     if types_list:
@@ -517,9 +539,10 @@ def main() -> int:
             for _ in range(per):
                 jobs.append((lang, ""))
 
+    total_jobs = len(jobs)
     written: list[tuple[Path, Path | None]] = []
     try:
-        for lang, typ in jobs:
+        for idx, (lang, typ) in enumerate(jobs, start=1):
             data = generate_problem(
                 client,
                 model=args.model,
@@ -533,6 +556,31 @@ def main() -> int:
             written.append(paths)
             if args.show:
                 print(format_problem_markdown(data))
+
+            if args.git_push and repo is not None:
+                rel_paths = _paths_for_git_add(repo, [paths])
+                base_msg = args.git_message.strip()
+                if base_msg:
+                    msg = f"{base_msg} ({idx}/{total_jobs})"
+                else:
+                    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%MZ")
+                    stem = paths[0].stem
+                    msg = f"문제 자동 생성 ({idx}/{total_jobs}): {stem} ({ts})"
+                try:
+                    git_note = git_add_commit_push(
+                        repo,
+                        rel_paths,
+                        remote=args.git_remote,
+                        branch=args.git_branch or None,
+                        message=msg,
+                    )
+                    print(f"\n[git] [{idx}/{total_jobs}] {git_note}")
+                except ValueError as e:
+                    print(f"\n[git] {e}", file=sys.stderr)
+                    return 4
+                except subprocess.CalledProcessError as e:
+                    print(f"\n[git] 푸시 실패 (exit {e.returncode}): {e}", file=sys.stderr)
+                    return 5
     except ollama.ResponseError as e:
         print(f"Ollama API 오류: {e}", file=sys.stderr)
         return 2
@@ -540,39 +588,12 @@ def main() -> int:
         print(str(e), file=sys.stderr)
         return 3
 
-    # 본문은 파일에만 두고, 저장 결과는 stdout에 표시 (stderr만 보면 저장 여부가 안 보이는 경우 방지)
     print(f"\n저장 완료: 마크다운 {len(written)}개 → 루트 {root.resolve()}")
     for md_path, json_path in written:
         line = f"  - {md_path}"
         if json_path:
             line += f"  (+ {json_path.name})"
         print(line)
-
-    if args.git_push:
-        repo = _get_git_root(_SCRIPT_DIR)
-        if not repo:
-            print("\n[git] 스크립트 위치가 git 저장소 안이 아니어서 푸시를 건너뜁니다.", file=sys.stderr)
-            return 4
-        rel_paths = _paths_for_git_add(repo, written)
-        msg = args.git_message.strip()
-        if not msg:
-            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%MZ")
-            msg = f"문제 자동 생성 {len(written)}개 ({ts})"
-        try:
-            git_note = git_add_commit_push(
-                repo,
-                rel_paths,
-                remote=args.git_remote,
-                branch=args.git_branch or None,
-                message=msg,
-            )
-            print(f"\n[git] {git_note}")
-        except ValueError as e:
-            print(f"\n[git] {e}", file=sys.stderr)
-            return 4
-        except subprocess.CalledProcessError as e:
-            print(f"\n[git] 실패 (exit {e.returncode}): {e}", file=sys.stderr)
-            return 5
 
     return 0
 
